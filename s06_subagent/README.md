@@ -54,8 +54,22 @@ def run_subagent(prompt: str) -> str:
             results.append({... "content": output})
         messages.append({"role": "user", "content": results})
 
-    return "Subagent stopped after 30 turns without a final answer."
+    return summarize_subagent_progress(messages)
 ```
+
+The loop has a budget of 30 model turns, not 30 individual tool calls. If it
+exhausts that budget, `summarize_subagent_progress` makes at most one additional
+request to the same model, using the complete child conversation, including the
+last batch of tool results, and an explicit budget-exhausted notice. It asks for
+confirmed findings and evidence, unfinished work, uncertainties, and a next step.
+
+That request retains the tool schemas needed to describe historical messages but
+sets `tool_choice={"type": "none"}` to disable further tool use. Its SDK retries
+are disabled and its request timeout is 30 seconds. The response never re-enters
+the tool loop or Stop hooks. The parent receives text prefixed with
+`[Subagent status: budget_exhausted]`, so partial progress is not confused with
+normal completion. Failed, empty, truncated, or tool-bearing summary responses
+return a fixed incomplete-task notice. Normal completion makes no summary request.
 
 The main Agent calls it just like any other tool:
 
@@ -80,7 +94,7 @@ The boundary is:
 |----------|--------|--------|
 | Conversation | Fresh `messages[]` | Parent history is not copied into the subagent |
 | Execution | Same process and `WORKDIR` | Filesystem changes remain visible to both loops |
-| Return value | Final text only | Child tool calls and results are not copied into parent messages |
+| Return value | Final text or budget-exhausted progress | Child tool calls and results are not copied into parent messages |
 | Delegation depth | No `task` in `SUB_TOOLS` | This lesson permits one delegation level |
 | Tool policy | Shared Hooks | Parent and subagent use the same permission checks |
 
