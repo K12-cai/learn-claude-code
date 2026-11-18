@@ -31,7 +31,7 @@ Agent 在修一个 bug。为了追踪调用链，它读取了许多文件；每�
 **run_subagent** 创建新的消息列表，运行嵌套循环，并返回最终文本：
 
 ```python
-SUB_TOOLS = list(BASE_TOOLS)  # 不含 task 工具
+SUB_TOOLS = list(BASE_TOOLS)  # no task tool
 
 def run_subagent(prompt: str) -> str:
     messages = [{"role": "user", "content": prompt}]
@@ -54,8 +54,20 @@ def run_subagent(prompt: str) -> str:
             results.append({... "content": output})
         messages.append({"role": "user", "content": results})
 
-    return "Subagent stopped after 30 turns without a final answer."
+    return summarize_subagent_progress(messages)
 ```
+
+循环预算是 30 轮模型请求，不是 30 次工具调用。耗尽预算后，
+`summarize_subagent_progress` 最多额外请求一次同一个模型，传入完整的子 Agent
+对话（包括最后一批工具结果）和明确的预算耗尽说明，要求整理已确认的发现及证据、
+未完成事项、不确定信息和建议下一步。
+
+收尾请求保留描述历史消息所需的工具定义，但设置 `tool_choice={"type": "none"}`，
+禁止继续调用工具；关闭 SDK 自动重试，并设置 30 秒请求超时。返回后不再进入工具循环，
+也不再运行可能要求继续工作的 Stop Hooks。主 Agent 收到的文本带有
+`[Subagent status: budget_exhausted]` 前缀，明确区分部分进展与正常完成。
+收尾请求失败、输出为空、被截断或仍包含工具调用时，返回固定的未完成提示。
+正常完成不会增加这次摘要请求。
 
 主 Agent 调用时，跟调其他工具一样：
 
@@ -80,7 +92,7 @@ TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 |------|------|------|
 | 对话 | 全新的 `messages[]` | 不把父对话复制给子 Agent |
 | 执行 | 同一进程和 `WORKDIR` | 两个循环都能看到文件系统修改 |
-| 返回值 | 只返回最终文本 | 子 Agent 的工具调用和结果不进入父消息列表 |
+| 返回值 | 最终文本或预算耗尽后的进度 | 子 Agent 的工具调用和结果不进入父消息列表 |
 | 委派深度 | `SUB_TOOLS` 中没有 `task` | 本章只允许一层委派 |
 | 工具策略 | 共享 Hooks | 父子循环使用相同的权限检查 |
 

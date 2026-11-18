@@ -1,4 +1,5 @@
 import builtins
+import copy
 import importlib.util
 import os
 import sys
@@ -6,6 +7,8 @@ import tempfile
 import types
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,11 @@ def load_lesson(temp_cwd: Path):
     class FakeAnthropic:
         def __init__(self, *args, **kwargs):
             self.messages = types.SimpleNamespace(create=None)
+            self.options = []
+
+        def with_options(self, **kwargs):
+            self.options.append(kwargs)
+            return self
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_anthropic.Anthropic = FakeAnthropic
@@ -111,6 +119,8 @@ def test_subagent_starts_with_fresh_messages_and_returns_final_text():
         "bash", "read_file", "write_file", "edit_file", "glob",
     }
     assert result == "The note says child input."
+    assert len(calls) == 2
+    assert lesson.client.options == []
 
 
 def test_subagent_file_tools_keep_the_kernel_permission_boundary():
@@ -130,3 +140,165 @@ def test_subagent_file_tools_keep_the_kernel_permission_boundary():
 
         assert result == "Permission denied by user"
         assert not outside.exists()
+
+
+def test_budget_exhaustion_preserves_evidence_and_summarizes_without_tools():
+    with tempfile.TemporaryDirectory() as tmp:
+        lesson = load_lesson(Path(tmp))
+    calls = []
+    executed = []
+
+    def create(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        if len(calls) <= 30:
+            turn = len(calls)
+            return types.SimpleNamespace(
+                stop_reason="tool_use",
+                content=[
+                    tool_block("read_file", f"read_{turn}", path="note.txt"),
+                    tool_block("glob", f"glob_{turn}", pattern="*.py"),
+                ],
+            )
+        return types.SimpleNamespace(
+            stop_reason="end_turn",
+            content=[types.SimpleNamespace(
+                type="text",
+                text="Confirmed note.txt has evidence; tests remain unchecked.",
+            )],
+        )
+
+    def execute(block, handlers):
+        executed.append(block.id)
+        return f"Evidence from {block.id}"
+
+    lesson.client.messages.create = create
+    lesson.execute_tool = execute
+    # The exhausted path must not run a Stop hook that could request more work.
+    lesson.HOOKS["Stop"] = [lambda _: pytest.fail("Stop hook reopened the loop")]
+    result = lesson.run_subagent("Read note.txt and check tests.")
+
+    assert result.startswith("[Subagent status: budget_exhausted]")
+    assert "note.txt has evidence" in result
+    assert "tests remain unchecked" in result
+    assert len(calls) == 31
+    # The budget counts model turns, not individual tool invocations.
+    assert len(executed) == 60
+    assert lesson.client.options == [{"timeout": 30.0, "max_retries": 0}]
+    final_call = calls[-1]
+    assert final_call["model"] == calls[0]["model"]
+    assert final_call["tool_choice"] == {"type": "none"}
+    assert final_call["messages"][0] == {
+        "role": "user", "content": "Read note.txt and check tests."
+    }
+    assert "budget is exhausted" in final_call["messages"][-1]["content"]
+    assert "Evidence from read_30" in str(final_call["messages"][-2])
+    # Every tool call, including the final batch, has its matching result.
+    transcript = final_call["messages"]
+    for index, message in enumerate(transcript):
+        if message["role"] != "assistant":
+            continue
+        ids = [block.id for block in message["content"] if block.type == "tool_use"]
+        results = transcript[index + 1]["content"]
+        assert [block["tool_use_id"] for block in results] == ids
+
+
+@pytest.mark.parametrize("failure", [
+    "timeout", "exception", "empty", "whitespace", "tool", "text_and_tool", "truncated",
+])
+def test_budget_summary_failure_returns_once_without_executing_tools(failure):
+    with tempfile.TemporaryDirectory() as tmp:
+        lesson = load_lesson(Path(tmp))
+    calls = []
+    executed = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 30:
+            return types.SimpleNamespace(
+                stop_reason="tool_use",
+                content=[tool_block("read_file", f"read_{len(calls)}", path="note.txt")],
+            )
+        if failure == "timeout":
+            raise TimeoutError("summary timed out")
+        if failure == "exception":
+            raise RuntimeError("provider unavailable")
+        text = types.SimpleNamespace(type="text", text="partial answer")
+        tool = tool_block("write_file", "unexpected", path="should-not-exist.txt", content="x")
+        content = {
+            "empty": [],
+            "whitespace": [types.SimpleNamespace(type="text", text="  \n")],
+            "tool": [tool],
+            "text_and_tool": [text, tool],
+            "truncated": [text],
+        }[failure]
+        return types.SimpleNamespace(
+            stop_reason="max_tokens" if failure == "truncated" else "end_turn",
+            content=content,
+        )
+
+    lesson.client.messages.create = create
+    lesson.execute_tool = lambda block, _: executed.append(block.id) or "read evidence"
+    result = lesson.run_subagent("Inspect the repository.")
+
+    assert result.startswith("[Subagent status: budget_exhausted]")
+    assert "Progress summary unavailable" in result
+    assert "task may be incomplete" in result
+    assert len(calls) == 31
+    assert len(executed) == 30
+    assert "unexpected" not in executed
+    assert lesson.client.options == [{"timeout": 30.0, "max_retries": 0}]
+
+
+def test_stop_hook_cannot_extend_the_budget_or_reopen_the_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        lesson = load_lesson(Path(tmp))
+    calls = []
+    hook_calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(
+            stop_reason="end_turn",
+            content=[types.SimpleNamespace(type="text", text="current findings")],
+        )
+
+    def stop(messages):
+        hook_calls.append(len(messages))
+        return "Please continue checking."
+
+    lesson.client.messages.create = create
+    lesson.HOOKS["Stop"] = [stop]
+    result = lesson.run_subagent("Inspect the repository.")
+
+    assert result.startswith("[Subagent status: budget_exhausted]")
+    assert len(calls) == 31
+    assert len(hook_calls) == 30
+    assert calls[-1]["tool_choice"] == {"type": "none"}
+
+
+def test_normal_completion_on_the_last_turn_does_not_request_a_summary():
+    with tempfile.TemporaryDirectory() as tmp:
+        lesson = load_lesson(Path(tmp))
+    calls = []
+    executed = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 30:
+            return types.SimpleNamespace(
+                stop_reason="tool_use",
+                content=[tool_block("read_file", f"read_{len(calls)}", path="note.txt")],
+            )
+        return types.SimpleNamespace(
+            stop_reason="end_turn",
+            content=[types.SimpleNamespace(type="text", text="finished on turn 30")],
+        )
+
+    lesson.client.messages.create = create
+    lesson.execute_tool = lambda block, _: executed.append(block.id) or "read evidence"
+    result = lesson.run_subagent("Inspect the repository.")
+
+    assert result == "finished on turn 30"
+    assert len(calls) == 30
+    assert len(executed) == 29
+    assert lesson.client.options == []

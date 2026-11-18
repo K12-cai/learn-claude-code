@@ -54,8 +54,21 @@ def run_subagent(prompt: str) -> str:
             results.append({... "content": output})
         messages.append({"role": "user", "content": results})
 
-    return "Subagent stopped after 30 turns without a final answer."
+    return summarize_subagent_progress(messages)
 ```
+
+ループの予算はモデルへのリクエスト 30 回であり、個々のツール呼び出し 30 回ではない。
+予算を使い切ると、`summarize_subagent_progress` が同じモデルへ最大 1 回だけ追加で
+リクエストする。最後のツール結果を含む子の会話と予算超過の通知を渡し、確認済みの
+発見と根拠、未完了の作業、不確かな情報、次の手順をまとめさせる。
+
+過去のメッセージを記述するためのツール定義は残すが、
+`tool_choice={"type": "none"}` で新しいツール呼び出しを禁止する。SDK の自動再試行を
+無効にし、リクエストのタイムアウトを 30 秒に設定する。応答はツールループや
+Stop Hooks に戻らない。親へ返すテキストには `[Subagent status: budget_exhausted]`
+という接頭辞が付くため、途中経過を正常完了と区別できる。要約が失敗、空、途中で切断、
+またはツール呼び出しを含む場合は、未完了を示す固定メッセージを返す。
+正常終了時には追加の要約リクエストを行わない。
 
 メイン Agent の呼び出しは、他のツールと同じ：
 
@@ -80,7 +93,7 @@ TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 |------|------|------|
 | 会話 | 新しい `messages[]` | 親の会話をサブエージェントへコピーしない |
 | 実行 | 同じプロセスと `WORKDIR` | どちらのループからもファイル変更が見える |
-| 戻り値 | 最終テキストのみ | 子のツール呼び出しと結果を親 messages へコピーしない |
+| 戻り値 | 最終テキストまたは予算超過時の途中経過 | 子のツール呼び出しと結果を親 messages へコピーしない |
 | 委任の深さ | `SUB_TOOLS` に `task` なし | 本章では 1 階層の委任だけを許可 |
 | ツールポリシー | Hooks を共有 | 親子で同じ権限チェックを使う |
 
